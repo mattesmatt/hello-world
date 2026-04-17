@@ -1,0 +1,182 @@
+from operator import index
+
+import pandas as pd
+from pandas._config import display
+import pyodbc
+import smtplib
+from email.message import EmailMessage
+import os
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.width', 1000)
+
+DB_CONFIG = {
+    'driver': '{ODBC Driver 18 for SQL Server}',
+    'server': r'SERVER22\DB22',
+    'database': 'Atlascore'
+}
+
+TEAM_EMAILS = {
+    "is": "email1@mattemailmatt.com",
+    "tsy": "email2@mattemailmatt.com",
+    "app support": "email3@mattemailmatt.com"
+}
+#CHANGE TO /TEST/control-list for any testing being done with this script!!!
+control_list=r"\\networkpath\list.csv"
+
+def get_sql():
+    # -- The parameters for the script. Server, database and driver wont change
+    conn_str = (
+    f'DRIVER={DB_CONFIG["driver"]};'
+    f'SERVER={DB_CONFIG["server"]};'
+    f'DATABASE={DB_CONFIG["database"]};'
+    'Trusted_Connection=yes;'
+    'TrustServerCertificate=yes;'
+    )
+
+    query="""SELECT c.companycode,r.RoleName,m.ModuleName,replace(ep.PermissionName,',','-') as "PermissionName",eu.UserName,EmailID
+FROM Atlascore..EMTRolePermission rp (nolock)
+JOIN Atlascore..EMTRole r (nolock) ON rp.EMTRoleId = r.EMTRoleId
+join Atlascore..EMTPermission (nolock) ep on ep.EMTPermissionId=rp.EMTPermissionId
+JOIN Atlascore..EMTModule m (nolock) ON ep.EMTModuleId = m.EMTModuleId
+JOIN Atlascore..EMTUserRole (nolock) eur on eur.EMTRoleId=r.EMTRoleId
+join Atlascore..EMTUser eu (nolock) on eur.EMTUserId=eu.EMTUserId
+JOIN Atlascore..EMTRoleCompany (nolock) cr on cr.EMTRoleId = r.EMTRoleId
+JOIN Atlascore..Company c (nolock) on c.CompanyID = cr.CompanyId
+WHERE eu.Status = 'E'
+and r.RoleName not in ('Admin2','Admin3','Admin','Support')
+and isADEnabled=1
+ORDER BY username,2,3,4,1"""
+
+    try:
+        conn=pyodbc.connect(conn_str)
+        sql_df=pd.read_sql(query,conn)
+        conn.close()
+        return sql_df
+    except Exception as e:
+        print(f"An error occurred while getting TEST data: {e}")
+        return None
+
+"""to test the get_sql function
+my_df=get_sql()
+if my_df is not None:
+    print(my_df.head())
+"""
+
+def send_email(updated_control_list,team,ticket,recipient_string):
+    #Save the CSV file to XLSX in order to compress the size for the SDP
+    target_folder=r"C:\Temp\Sql"
+    if not os.path.exists(target_folder):
+        os.makedirs(target_folder)
+    print("Converting the CSV to excel by saving to temp directory for the email. . .")
+    temp_xlsx = os.path.join(target_folder,f"List-{ticket}.xlsx")
+
+    #convert to xlsx
+    updated_control_list.to_excel(temp_xlsx,index=False,engine='openpyxl')
+
+    #Change the team name for IS only and leave the team name for everyone else on the email subject
+    clean_team=team.lower().strip()
+    if clean_team.lower()=="twam2":
+        display_name="ADMIN"
+    else:
+        display_name=team.upper()
+
+
+    #Email step
+    msg = EmailMessage()
+    msg['Subject']=f"Re: [Request ID :##RE-{ticket}##] - {display_name} - Sandbox Control List"
+    msg['From']="app_supp_hazeltree@hedgeserv.com"
+    msg['To']=recipient_string
+    msg.set_content(f"Hi {display_name},\n\nPlease find the updated control list for Ticket {ticket}. Ready for task 3.\n\nThanks,\nApp Support")
+
+    print(f"Attempting to send to: {msg['To']}")
+
+    try:
+        if not os.path.exists(control_list):
+            print(f"ERROR: attachment not found at {control_list}")
+            return
+
+        #Add the converted XLSX
+        with open(temp_xlsx,'rb') as f:
+            file_data=f.read()
+            msg.add_attachment(file_data,maintype='application',subtype='vnd.openxmlformats-officedocument.spreadsheetml.sheet',filename=os.path.basename(temp_xlsx))
+
+        #Send the email
+        with smtplib.SMTP('mail.hedgeservcustomers.com',25) as server:
+            server.starttls()
+            #server.set_debuglevel(1)
+            server.send_message(msg)
+            print(f"Email sent to {recipient_string} with attachment ({os.path.getsize(temp_xlsx) / 1024:.1f} KB) sent.")
+
+            #remove the temp file
+            os.remove(temp_xlsx)
+            print("Temp file deleted")
+
+    except Exception as e:
+        print(f"Email failed: {e}")
+
+
+
+#Grab the data and input into two data frames for the comparison
+sql_df=get_sql()
+csv_df=pd.read_csv(control_list)
+
+#normalize the data to lowercase in order to avoid case sensitivity diffs
+sql_df=sql_df.astype(str).apply(lambda x: x.str.lower().str.strip())
+csv_df=csv_df.astype(str).apply(lambda x: x.str.lower().str.strip())
+
+#Comparison CHECK
+diff_df = pd.merge(sql_df, csv_df, how='left', indicator=True)
+diff_df = diff_df[diff_df['_merge'] == 'left_only'].drop(columns=['_merge'])
+diff_df.to_csv(r"C:\Temp\Sql\Task2-Sandbox-Differences.csv",index=False)
+
+#Check for differences and review with choices
+if not diff_df.empty:
+    print(f"Differences found.")
+    print(diff_df)
+    print("\nPlease review in the python console or in the temporary CSV file saved locally.")
+    print(r"Stored Locally: (C:\Temp\Sql\Task2-Sandbox-Differences.csv)")
+    print("If all looks well, please approve the users in the application and proceed with next steps")
+
+#Choice to update the control list
+    update_choice=input("\nUpdate the control list? (y/n):").lower()
+    if update_choice == "y":
+        file_exists=os.path.isfile(control_list)
+        #updated_df=pd.concat([csv_df, diff_df],ignore_index=True)
+
+        #check last uncomment..Add a new line in case of manual user input.
+        if file_exists:
+            with open(control_list, 'rb+') as f:
+                f.seek(-1,os.SEEK_END)
+                last_char=f.read(1)
+                if last_char != b'\n':
+                    print("DEBUG: Missing newline at end of file. Fixing...")
+                    f.write(b'\n')
+
+        #Append the differences to the control list
+        diff_df.to_csv(control_list,mode='a', index=False,header=not file_exists,lineterminator='\n')
+        print("Control list updated.")
+
+        #Convert into a DF for later usage on the email
+        print("Saving the control list to a DF for the conversion on the email attachment. . .")
+        updated_control_list=pd.read_csv(control_list)
+
+#Choice to send an email
+        email_choice = input("\nDo you want to update a ticket and send an email? (y/n):").lower().strip()
+        if email_choice == "y":
+            print(f"\nAvailable Teams: {','.join(TEAM_EMAILS.keys())}")
+            team = input("\nEnter Team Name: (Team 1 or Team 2)").lower().strip()
+            ticket = input("What is the ticket number?")
+            recipient = TEAM_EMAILS.get(team)
+            if not recipient:
+                recipient = input(f"Team '{team}' not found. Enter email: ")
+
+            final_recipients = f"{recipient},commonemail@mattemailmatt.com,commonemail@mattemailmatt.com"
+            send_email(updated_control_list, team.upper(), ticket, final_recipients)
+        else:
+            print("No emails will be sent")
+    else:
+        print("Control list won't be updated.")
+else:
+    print("No differences found.")
